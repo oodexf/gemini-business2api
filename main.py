@@ -967,7 +967,8 @@ async def admin_get_accounts(request: Request):
             "disabled": config.disabled,
             "cooldown_seconds": cooldown_seconds,
             "cooldown_reason": cooldown_reason,
-            "conversation_count": account_manager.conversation_count
+            "conversation_count": account_manager.conversation_count,
+            "session_usage_count": account_manager.session_usage_count
         })
 
     return {"total": len(accounts_info), "accounts": accounts_info}

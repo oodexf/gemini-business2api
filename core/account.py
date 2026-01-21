@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import time
+import random
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, TYPE_CHECKING
@@ -106,7 +107,8 @@ class AccountManager:
         self.last_error_time = 0.0
         self.last_429_time = 0.0  # 429错误专属时间戳
         self.error_count = 0
-        self.conversation_count = 0  # 累计对话次数
+        self.conversation_count = 0  # 累计对话次数（用于统计展示）
+        self.session_usage_count = 0  # 本次启动后使用次数（用于均衡轮询）
 
     async def get_jwt(self, request_id: str = "") -> str:
         """获取 JWT token (带错误处理)"""
@@ -289,7 +291,7 @@ class MultiAccountManager:
         logger.info(f"[MULTI] [ACCOUNT] 添加账户: {config.account_id}")
 
     async def get_account(self, account_id: Optional[str] = None, request_id: str = "") -> AccountManager:
-        """获取账户 (智能选择或指定) - 优先选择健康账户，提升响应速度"""
+        """获取账户 - 加权随机轮询，并发安全且均衡分配"""
         req_tag = f"[req_{request_id}] " if request_id else ""
 
         # 如果指定了账户ID（无需锁）
@@ -301,39 +303,40 @@ class MultiAccountManager:
                 raise HTTPException(503, f"Account {account_id} temporarily unavailable")
             return account
 
-        # 智能选择可用账户（优先健康账户，提升响应速度）
-        available_accounts = []
+        # 筛选所有可用账户并计算权重
+        weighted_accounts = []
         for acc_id in self.account_list:
             account = self.accounts[acc_id]
             # 检查账户是否可用（会自动恢复429冷却期后的账户）
             if (account.should_retry() and
                 not account.config.is_expired() and
                 not account.config.disabled):
-                # 计算账户健康度（error_count越低越健康）
-                health_score = -account.error_count  # 负数，越大越健康
-                available_accounts.append((acc_id, health_score))
 
-        if not available_accounts:
+                # 计算权重：使用越少权重越高（避免除零）
+                usage_weight = 1.0 / (account.session_usage_count + 1)
+
+                # 健康度因子：无错误=1.0，有错误=0.5（降低不健康账户被选中概率）
+                health_factor = 1.0 if account.error_count == 0 else 0.5
+
+                # 综合权重
+                weight = usage_weight * health_factor
+                weighted_accounts.append((account, weight))
+
+        if not weighted_accounts:
             raise HTTPException(503, "No available accounts")
 
-        # 按健康度排序（优先选择error_count最低的账户）
-        available_accounts.sort(key=lambda x: x[1], reverse=True)
+        # 加权随机选择（并发请求自然分散，无需加锁）
+        accounts = [acc for acc, _ in weighted_accounts]
+        weights = [w for _, w in weighted_accounts]
+        selected = random.choices(accounts, weights=weights, k=1)[0]
 
-        # 只在更新索引时加锁（最小化锁持有时间）
-        async with self._index_lock:
-            if not hasattr(self, '_available_index'):
-                self._available_index = 0
+        # 增加使用计数（允许少量竞争条件，统计上可忽略）
+        selected.session_usage_count += 1
 
-            # 在健康账户中轮询（只在前50%健康账户中选择）
-            healthy_count = max(1, len(available_accounts) // 2)
-            healthy_accounts = [acc_id for acc_id, _ in available_accounts[:healthy_count]]
-
-            account_id = healthy_accounts[self._available_index % len(healthy_accounts)]
-            self._available_index = (self._available_index + 1) % len(healthy_accounts)
-
-        account = self.accounts[account_id]
-        logger.info(f"[MULTI] [ACCOUNT] {req_tag}选择账户: {account_id} (健康度: {account.error_count}错误)")
-        return account
+        logger.info(f"[MULTI] [ACCOUNT] {req_tag}选择账户: {selected.config.account_id} "
+                    f"(本次使用: {selected.session_usage_count}, 错误数: {selected.error_count}, "
+                    f"可用账户数: {len(weighted_accounts)})")
+        return selected
 
 
 # ---------- 配置文件管理 ----------
