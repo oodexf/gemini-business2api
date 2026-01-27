@@ -274,7 +274,3 @@ class DuckMailClient:
                 self.log_callback(level, message)
             except Exception:
                 pass
-
-    @staticmethod
-    def _extract_code(text: str) -> Optional[str]:
-        return extract_verification_code(text)
